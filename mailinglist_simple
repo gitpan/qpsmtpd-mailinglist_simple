@@ -1,0 +1,219 @@
+=head1 NAME
+
+mailinglist_simple Version 1.0 by Marc Sebastian Pelzer
+
+=head1 DESCRIPTION
+
+This plugin adds very simple mailinglist functionality to alias-file based distribution lists.
+It reads its config-file config/mailinglist_simple and checks if the RCPT is a defined mailinglist.
+If true, it adds a "Reply-to" header to the email before it gets queued. It also adds a "Precedence: bulk"
+and "X-Mailing-List" header to prevent mail-loops/bounces from auto-reply applications.
+
+Its also possible to define a mailinglist as PUBLIC or PROTECTED - meaning if everyone can send an email to
+the list or just members of the list. You can also have a different signature for each list that will be
+added to the end of the mail.
+
+This plugin needs to be called in the config file config/plugins and must be BEFORE the "rcpt_ok" plugin!
+
+If you want PROTECTED maillinglist support, you must call the plugin with one parameter - the path and/or
+filename to your alias directory or alias file where your distribution lists are defined on the format:
+
+localpart:		email@email.com,email2@email.com,email3@email.com
+
+Example config extries:
+
+mailinglist_simple
+
+mailinglist_simple /usr/local/exim/virtual-domains/
+
+mailinglist_simple /etc/aliases
+
+Maybe you need to change the sourcecode to fit it to your alias file schema. Should not be too hard
+if you know Perl :)
+
+=cut
+
+use Qpsmtpd::DSN;
+
+sub register {
+
+  my ($self, $qp, @args) = @_;
+
+  if (@args > 0) {
+
+	# check if we got an directory or file
+	#
+	if (-d $args[0] && -r $args[0]) {
+
+      $self->{_ALIAS_DIRECTORY} = $args[0];
+	  $self->{_PROTECTED_SUPPORT} = 'true';
+
+	  $self->log(LOGINFO, "OK. Using alias directory '". $args[0] . "'");
+
+	} elsif (-f $args[0] && -r $args[0]) {
+
+	  $self->{_ALIAS_FILE} = $args[0];
+	  $self->{_PROTECTED_SUPPORT} = 'true';
+
+	  $self->log(LOGINFO, "OK. Using alias file '" . $args[0] . "'");
+
+	} else {
+
+      die "Bad argument - need a valid alias directory or full path to a file: $args[0]";
+    }
+
+  } else {
+
+	$self->{_PROTECTED_SUPPORT} = 'false';  
+  
+  }
+}
+
+sub hook_rcpt {
+
+	my ($self, $transaction, $recipient) = @_;
+	my ($element, $list, $domain, $is_protected, $emails, $localpart, @emails, $line, $tmp, $isAValidSender, $signature);
+
+	my @mailinglists = $self->qp->config("mailinglist_simple");
+	unless (@mailinglists) { $self->log(LOGDEBUG, "No configuration file config/mailinglist_simple found."); return DECLINED; }
+
+	my $host = lc $recipient->host;
+	my $from = lc($recipient->user) . '@' . $host;
+
+	foreach $element (@mailinglists) {
+
+		chomp($element);
+
+		if ($element =~ m!^\s*\#! || $element =~ m!^\n$!) { next; }		# ignore comments
+
+		# split line into pieces
+		#
+		($list, $domain, $is_protected, $signature) = ($element =~ m!^\s*([^\@]+)\@([\w\d\-\_\.]+)\s*([\d]?)\s*(\S*)!);
+
+		# try to mach RCPT TO and defined lists
+		#
+		if ($list eq lc($recipient->user) && $domain eq $host) {
+
+			if ($is_protected =~ m!^\d$! && $self->{_PROTECTED_SUPPORT} eq 'true') {
+
+				# check if SENDER is member of the lists
+				#
+				$self->log(LOGNOTICE, "Found email to a PROTECTED mailinglist -> $from - checking SENDER");
+
+				if ($self->{_ALIAS_DIRECTORY}) {
+
+					unless (-r $self->{_ALIAS_DIRECTORY} . "/$host") { $self->log(LOGWARN, "Error while try to open ALIAS file '" . $self->{_ALIAS_DIRECTORY} . "/$host"); return DENYSOFT; }
+
+				  	open (ALIAS, $self->{_ALIAS_DIRECTORY} . "/$host");
+
+				} elsif ($self->{_ALIAS_FILE}) {
+
+					unless (-r $self->{_ALIAS_FILE}) { $self->log(LOGWARN, "Error while try to open ALIAS file '" . $self->{_ALIAS_FILE}); return DENYSOFT; }
+					
+					open (ALIAS, $self->{_ALIAS_FILE});
+
+				}
+
+				  while ($line = <ALIAS>) {
+
+				    chomp($line);
+
+				    if ($line =~ m!^\s*\#! || $line =~ m!^\n$! || ! $line) { next; }
+
+				    ($localpart, $emails) = ($line =~ m!^\s*([^\:\s]+)\s*\:\s*(.+)$!);
+
+					if ($localpart eq $list) {
+
+						(@emails) = split(",", $emails);
+
+						foreach $tmp (@emails) { $tmp =~ s!\s!!g; if (lc($tmp) eq lc($transaction->sender->address())) { ++$isAValidSender; } }
+					}
+				  }
+
+				  close (ALIAS);
+
+				  if ($isAValidSender >= 1) {
+
+					$self->log(LOGNOTICE, "Sender '" . $transaction->sender->address() . "' is a member of mailinglist '$from'. Accepting.");
+					
+					$transaction->notes("mailinglist", $from);      # putting email into transaction notes to write the "Reply-to" header later...
+
+					# add signature - if defined and available in the file-system
+					#
+					if (-e $signature && -r $signature) { $self->log(LOGNOTICE, "Adding signature '$signature'."); $transaction->notes("mailinglist_signature", $signature); }
+
+					return DECLINED;
+					
+				  } else {
+				  
+				  	$self->log(LOGWARN, "Sender '" . $transaction->sender->address() . "' is NOT a member of mailinglist '$from'. Rejecting.");
+				  	
+				  	return Qpsmtpd::DSN->no_such_user("mail to $from not accepted from you");
+				  }
+				  
+			} else {
+
+				# this is an PUBLIC list - everyone can send an email to it
+				#
+				$self->log(LOGNOTICE, "Found email to a PUBLIC mailinglist '$from'. Accepting.");
+
+				$transaction->notes("mailinglist", $from);		# putting email into transaction notes to write the "Reply-to" header later...
+
+				# add signature - if defined and available in the file-system
+				#
+				if (-e $signature && -r $signature) { $self->log(LOGNOTICE, "Adding signature '$signature'."); $transaction->notes("mailinglist_signature", $signature); }
+
+				return DECLINED;
+			}
+		}
+	}
+
+	return DECLINED;
+}
+
+sub hook_data_post {
+
+	my ($self, $transaction) = @_;
+	my ($line, $signature);
+
+	unless ($transaction->notes("mailinglist")) {
+
+		$self->log(LOGDEBUG, "Email is not an email to a mailinglists. Ignoring.");
+
+		return DECLINED;
+	}
+
+	$self->log(LOGNOTICE, "Email is an email to a mailinglist -> " . $transaction->notes("mailinglist") . ". Adding Reply-to header element.");
+
+	my $headers = $transaction->header();
+
+	if ($headers->get("Precedence") =~ m!(bulk|list|junk)!i || $headers->get("X-Mailing-List") || $headers->get("X-loop") eq $transaction->notes("mailinglist") || $headers->get("Auto-Submitted")) {
+
+		$self->log(LOGWARN, "Loop detected or email from another mailinglist or auto-reply agent. Ignoring mail!");
+
+		return (DENY, "Loop detected!");
+	}
+
+	$headers->replace("Reply-to", $transaction->notes("mailinglist"));
+
+	# add header elements to prevent loops from auto-replies
+	#
+	$headers->add("Precedence", "bulk");
+	$headers->add("X-Mailing-List", "qpsmtpd mailinglist");
+	$headers->add("X-loop", $transaction->notes("mailinglist"));
+
+	#$headers->replace("Envelope-From", "");		# we will add envelope handling later ...
+
+	if ($transaction->notes("mailinglist_signature")) {
+
+		open (SIG, $transaction->notes("mailinglist_signature"));
+		while ($line = <SIG>) { $signature .= $line; }
+		close (SIG);
+
+		$transaction->body_write("\n\n--\n" . $signature);
+	}
+
+	return DECLINED;
+}
+
+1;
